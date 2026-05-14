@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: dvf-square-sync
+    runtime: python
+    buildCommand: "apt-get install -y libreoffice && pip install -r requirements.txt"
+    startCommand: "gunicorn app:app"
+    envVars:
+      - key: SQUARE_ACCESS_TOKEN
+        sync: false
+      - key: CURRENCY
+        value: USD
