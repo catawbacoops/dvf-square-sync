@@ -120,9 +120,121 @@ def archive_items(item_ids):
     log.info(f"Archived {len(objects)} item(s).")
 
 
+
+def update_prices(df, sku_map):
+    """
+    Update Square item variation prices from the wholesale price list.
+    Retail price = unit_price / (1 - gp_pct)
+    """
+    import copy
+    messages = []
+    updated, skipped, missing = 0, 0, []
+
+    objects = []
+    for _, row in df.iterrows():
+        sku = str(row["sku_clean"]).strip().upper()
+        if sku not in sku_map:
+            missing.append(sku)
+            continue
+
+        retail = row.get("retail_calc")
+        if not retail or pd.isna(retail) or retail <= 0:
+            skipped += 1
+            continue
+
+        price_cents = int(round(retail * 100))
+
+        variation_obj = copy.deepcopy(sku_map[sku])
+        for field in ["updated_at", "created_at", "is_deleted", "catalog_v1_ids"]:
+            variation_obj.pop(field, None)
+        variation_obj.setdefault("item_variation_data", {})["price_money"] = {
+            "amount": price_cents,
+            "currency": CURRENCY,
+        }
+        variation_obj["item_variation_data"]["pricing_type"] = "FIXED_PRICING"
+        objects.append(variation_obj)
+
+    # Batch upsert in groups of 1000
+    for i in range(0, len(objects), 1000):
+        payload = {
+            "idempotency_key": f"price-update-{datetime.utcnow().timestamp()}-{i}",
+            "batches": [{"objects": objects[i:i+1000]}],
+        }
+        resp = requests.post(f"{SQUARE_BASE_URL}/catalog/batch-upsert",
+                             headers=SQUARE_HEADERS, json=payload)
+        resp.raise_for_status()
+        updated += len(objects[i:i+1000])
+
+    if missing:
+        messages.append(f"⚠️  {len(missing)} SKU(s) not found in Square: {', '.join(missing[:20])}{'...' if len(missing) > 20 else ''}")
+    if skipped:
+        messages.append(f"ℹ️  {skipped} row(s) skipped — no valid price.")
+    messages.append(f"✅  Updated prices on {updated} item(s).")
+    return messages
+
+
 # ---------------------------------------------------------------------------
 # File reading
 # ---------------------------------------------------------------------------
+
+def read_price_list(file_storage):
+    """
+    Read the DVF wholesale price list.
+    Structure:
+      Row 0: blank
+      Row 1: date
+      Row 2-3: split headers
+      Row 4+: data (category header rows have no price — skipped)
+
+    Columns:
+      0  = SKU (format "123 456" -> strip space -> "123456")
+      2  = Case price
+      4  = Unit price
+      6  = Suggested retail
+      8  = GP%
+    """
+    filename = file_storage.filename or ""
+    suffix   = Path(filename).suffix.lower()
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        file_storage.save(tmp.name)
+        tmp_path = Path(tmp.name)
+
+    try:
+        engine = "xlrd" if suffix == ".xls" else "openpyxl"
+        df = pd.read_excel(tmp_path, header=None, dtype=str, engine=engine)
+
+        # Take only the columns we need
+        data = df.iloc[4:, [0, 2, 4, 6, 8]].copy()
+        data.columns = ["sku", "case_price", "unit_price", "sug_retail", "gp_pct"]
+
+        # Drop category header rows (no SKU or no price)
+        data = data.dropna(subset=["sku", "unit_price"])
+        data = data[data["unit_price"].str.strip().str.replace(".", "", 1).str.isnumeric()]
+
+        # Clean SKU — strip space, uppercase
+        data["sku_clean"] = data["sku"].str.replace(" ", "").str.strip().str.upper()
+
+        # Clean GP% -> decimal  e.g. "30%" -> 0.30
+        data["gp_clean"] = pd.to_numeric(
+            data["gp_pct"].str.replace("%", "").str.strip(), errors="coerce"
+        ) / 100
+
+        # Unit price as float
+        data["unit_price_num"] = pd.to_numeric(data["unit_price"], errors="coerce")
+
+        # Calculate retail = unit_price / (1 - gp%)
+        data["retail_calc"] = (data["unit_price_num"] / (1 - data["gp_clean"])).round(2)
+
+        # Drop rows where calculation failed
+        data = data.dropna(subset=["retail_calc"])
+        data = data[data["retail_calc"] > 0]
+
+        return data
+
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
 
 def read_vendor_file(file_storage):
     """
@@ -263,6 +375,30 @@ def sync():
 
     except Exception as e:
         log.exception("Sync error")
+        return jsonify({"status": "error", "messages": [f"❌  Error: {str(e)}"]}), 500
+
+
+@app.route("/api/sync/prices", methods=["POST"])
+def sync_prices():
+    if "file" not in request.files:
+        return jsonify({"status": "error", "messages": ["No file uploaded."]}), 400
+
+    if not SQUARE_ACCESS_TOKEN:
+        return jsonify({"status": "error", "messages": ["SQUARE_ACCESS_TOKEN not configured."]}), 500
+
+    file = request.files["file"]
+    try:
+        df = read_price_list(file)
+        messages = [f"📄  Read {len(df)} priced items from {file.filename}"]
+
+        sku_map = get_all_catalog_items()
+        messages.append(f"🔗  Loaded {len(sku_map)} SKUs from Square.")
+
+        messages += update_prices(df, sku_map)
+        return jsonify({"status": "ok", "messages": messages})
+
+    except Exception as e:
+        log.exception("Price sync error")
         return jsonify({"status": "error", "messages": [f"❌  Error: {str(e)}"]}), 500
 
 
@@ -519,6 +655,31 @@ HTML = '''<!DOCTYPE html>
     </button>
   </div>
 
+  <!-- Price Update -->
+  <div class="card">
+    <div class="card-title">💰 Price Update</div>
+    <div class="card-desc">
+      Upload your DVF wholesale price list. Retail prices are calculated as
+      <strong style="color:var(--blue)">Unit Price ÷ (1 - GP%)</strong>
+      and uploaded to Square for every matching SKU.
+    </div>
+    <div class="tags">
+      <span class="tag blue" style="border-color:#3b82f655;color:var(--blue);background:var(--blue-dim)">Retail = Unit ÷ (1 - GP%)</span>
+      <span class="tag green">Updates prices</span>
+    </div>
+    <div class="dropzone" id="dz-price">
+      <input type="file" accept=".xls,.xlsx" onchange="fileSelected(this, 'price')">
+      <div class="dropzone-icon">💲</div>
+      <div class="dropzone-text"><strong>Drop file here</strong> or click to browse</div>
+      <div class="dropzone-filename" id="fn-price"></div>
+    </div>
+    <button class="btn" id="btn-price" onclick="runPriceSync()" disabled
+            style="background:var(--blue-dim);border-color:#3b82f655;color:var(--blue)">
+      <div class="spinner" id="spin-price"></div>
+      <span id="btn-price-label">▶ Run Price Update</span>
+    </button>
+  </div>
+
   <!-- Discontinued -->
   <div class="card">
     <div class="card-title">🗃 Discontinued</div>
@@ -591,6 +752,35 @@ HTML = '''<!DOCTYPE html>
       btn.disabled       = false;
       spin.style.display = 'none';
       label.textContent  = type === 'oos' ? '▶ Run Out of Stock Sync' : '▶ Run Discontinued Sync';
+    }
+  }
+
+  async function runPriceSync() {
+    const file = files['price'];
+    if (!file) return;
+
+    const btn   = document.getElementById('btn-price');
+    const label = document.getElementById('btn-price-label');
+    const spin  = document.getElementById('spin-price');
+
+    btn.disabled       = true;
+    spin.style.display = 'block';
+    label.textContent  = 'Running...';
+    showResults([]);
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      const r    = await fetch('/api/sync/prices', {method: 'POST', body: formData});
+      const data = await r.json();
+      showResults(data.messages || [], data.status === 'error');
+    } catch(e) {
+      showResults(['❌ Network error: ' + e.message], true);
+    } finally {
+      btn.disabled       = false;
+      spin.style.display = 'none';
+      label.textContent  = '▶ Run Price Update';
     }
   }
 
