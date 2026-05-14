@@ -14,7 +14,6 @@ import re
 import copy
 import json
 import logging
-import subprocess
 import tempfile
 from pathlib import Path
 from datetime import datetime
@@ -131,6 +130,9 @@ def read_vendor_file(file_storage):
     Row 0: title row (skipped)
     Row 1: headers (Item | Description | ...)
     Row 2+: data
+
+    .xls files are read directly with xlrd.
+    .xlsx files are read with openpyxl.
     """
     filename = file_storage.filename or ""
     suffix   = Path(filename).suffix.lower()
@@ -141,20 +143,11 @@ def read_vendor_file(file_storage):
 
     try:
         if suffix == ".xls":
-            # Convert to xlsx using LibreOffice (available on Render via apt)
-            xlsx_path = tmp_path.with_suffix(".xlsx")
-            result = subprocess.run(
-                ["soffice", "--headless", "--convert-to", "xlsx",
-                 str(tmp_path), "--outdir", str(tmp_path.parent)],
-                capture_output=True, text=True, timeout=60
-            )
-            if result.returncode != 0:
-                raise RuntimeError(f"LibreOffice conversion failed: {result.stderr}")
-            read_path = xlsx_path
+            engine = "xlrd"
         else:
-            read_path = tmp_path
+            engine = "openpyxl"
 
-        df = pd.read_excel(read_path, header=1, dtype=str)
+        df = pd.read_excel(tmp_path, header=1, dtype=str, engine=engine)
         df.columns = [c.strip() for c in df.columns]
 
         # Normalise SKU column name
@@ -167,9 +160,6 @@ def read_vendor_file(file_storage):
 
     finally:
         tmp_path.unlink(missing_ok=True)
-        xlsx_path = tmp_path.with_suffix(".xlsx")
-        if xlsx_path.exists():
-            xlsx_path.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
