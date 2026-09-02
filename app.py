@@ -33,6 +33,7 @@ SQUARE_HEADERS      = {
     "Content-Type":   "application/json",
     "Square-Version": "2024-01-18",
 }
+SQUARE_TIMEOUT = (10, 25)  # (connect timeout, read timeout) seconds
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -54,7 +55,7 @@ def get_all_catalog_items():
         if cursor:
             params["cursor"] = cursor
         resp = requests.get(f"{SQUARE_BASE_URL}/catalog/list",
-                            headers=SQUARE_HEADERS, params=params)
+                            headers=SQUARE_HEADERS, params=params, timeout=SQUARE_TIMEOUT)
         resp.raise_for_status()
         data = resp.json()
         for obj in data.get("objects", []):
@@ -83,7 +84,7 @@ def set_sellable(skus, sku_map, sellable: bool):
             "batches": [{"objects": objects[i:i+1000]}],
         }
         resp = requests.post(f"{SQUARE_BASE_URL}/catalog/batch-upsert",
-                             headers=SQUARE_HEADERS, json=payload)
+                             headers=SQUARE_HEADERS, json=payload, timeout=SQUARE_TIMEOUT)
         resp.raise_for_status()
     label = "Sellable=Y" if sellable else "Sellable=N"
     log.info(f"Set {label} on {len(objects)} item(s).")
@@ -99,7 +100,8 @@ def archive_items(item_ids):
         resp = requests.post(
             f"{SQUARE_BASE_URL}/catalog/batch-retrieve",
             headers=SQUARE_HEADERS,
-            json={"object_ids": id_list[i:i+1000], "include_related_objects": False}
+            json={"object_ids": id_list[i:i+1000], "include_related_objects": False},
+            timeout=SQUARE_TIMEOUT
         )
         resp.raise_for_status()
         for obj in resp.json().get("objects", []):
@@ -115,7 +117,7 @@ def archive_items(item_ids):
             "batches": [{"objects": objects[i:i+1000]}],
         }
         resp = requests.post(f"{SQUARE_BASE_URL}/catalog/batch-upsert",
-                             headers=SQUARE_HEADERS, json=payload)
+                             headers=SQUARE_HEADERS, json=payload, timeout=SQUARE_TIMEOUT)
         resp.raise_for_status()
     log.info(f"Archived {len(objects)} item(s).")
 
@@ -161,7 +163,7 @@ def update_prices(df, sku_map):
             "batches": [{"objects": objects[i:i+1000]}],
         }
         resp = requests.post(f"{SQUARE_BASE_URL}/catalog/batch-upsert",
-                             headers=SQUARE_HEADERS, json=payload)
+                             headers=SQUARE_HEADERS, json=payload, timeout=SQUARE_TIMEOUT)
         resp.raise_for_status()
         updated += len(objects[i:i+1000])
 
