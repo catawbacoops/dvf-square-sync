@@ -413,6 +413,26 @@ def scrape_dvf(sku, session=None, name_hint=""):
     url = DVF_DETAIL_URL.format(sku=sku)
     out = {"sku": sku, "found": False, "url": url, "error": "", "method": ""}
     resp = soup = name = None
+
+    # 0) Exact SKU through BigCommerce's storefront API (fast, one request)
+    prod, gql_err = gql_product(sku, session=s)
+    out["graphql"] = gql_err or "found"
+    if prod and str(prod.get("sku", "")).strip().upper() == sku:
+        img = (prod.get("defaultImage") or {}).get("url", "")
+        cats = [e["node"]["name"] for e in (prod.get("categories") or {}).get("edges", [])]
+        out.update({
+            "found": True, "method": "storefront API",
+            "final_url": DVF_BASE + (prod.get("path") or "/"),
+            "name": prod.get("name", ""),
+            "description": _clean_description(prod.get("plainTextDescription", "")),
+            "image": img, "image_large": img,
+            "brand": (prod.get("brand") or {}).get("name", ""),
+            "breadcrumb": " / ".join(cats), "availability": "",
+            "sku_verified": True,
+        })
+        if out["name"]:
+            return out
+
     try:
         resp = _fetch(s, url)
         soup, name = _product_page(resp)
@@ -420,34 +440,6 @@ def scrape_dvf(sku, session=None, name_hint=""):
             out["method"] = "direct"
     except requests.RequestException as e:
         out["error"] = f"request failed: {e}"
-
-    if soup is None:
-        # 1) Exact SKU through BigCommerce's storefront API
-        prod, gql_err = gql_product(sku, session=s)
-        out["graphql"] = gql_err or "found"
-        if prod and prod.get("path"):
-            try:
-                presp = _fetch(s, DVF_BASE + prod["path"])
-                psoup, pname = _product_page(presp)
-                if psoup is not None:
-                    resp, soup, name = presp, psoup, pname
-                    out["method"] = "storefront API"
-            except requests.RequestException:
-                pass
-            if soup is None:
-                # Page fetch failed but the API gave us the data — use it directly
-                img = (prod.get("defaultImage") or {}).get("url", "")
-                cats = [e["node"]["name"] for e in (prod.get("categories") or {}).get("edges", [])]
-                out.update({
-                    "found": True, "method": "storefront API (data only)",
-                    "final_url": DVF_BASE + prod["path"], "name": prod.get("name", ""),
-                    "description": _clean_description(prod.get("plainTextDescription", "")),
-                    "image": img, "image_large": img,
-                    "brand": (prod.get("brand") or {}).get("name", ""),
-                    "breadcrumb": " > ".join(cats), "availability": "",
-                    "sku_verified": str(prod.get("sku", "")).strip().upper() == sku,
-                })
-                return out
 
     if soup is None:
         # 2) BigCommerce quick-search fragment
