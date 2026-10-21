@@ -269,6 +269,37 @@ def _name_query(desc):
     return re.sub(r"\s+", " ", t).strip()
 
 
+def debug_search(q):
+    """What the server actually receives from DVF's search for q."""
+    from urllib.parse import urljoin
+    r = _fetch(requests, DVF_SEARCH_URL, params={"search_query": q})
+    soup = BeautifulSoup(r.text, "html.parser")
+    hrefs = []
+    for a in soup.find_all("a", href=True):
+        h = urljoin(r.url, a["href"])
+        if "dutchvalleyfoods.com" in h and h not in hrefs:
+            hrefs.append(h)
+    scripts = [sc.get("src") for sc in soup.find_all("script", src=True)]
+    body_text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+    i = body_text.lower().find("result")
+    return {
+        "query": q,
+        "status": r.status_code,
+        "final_url": r.url,
+        "html_length": len(r.text),
+        "title": _text(soup.title),
+        "query_in_html": q in r.text,
+        "cards_found": len(_search_links(r.text, r.url)),
+        "card_links": _search_links(r.text, r.url)[:10],
+        "all_links_count": len(hrefs),
+        "links_not_menu_sample": [h for h in hrefs if "/categories" not in h][-40:],
+        "script_sources": [x for x in scripts if x][:40],
+        "text_near_results": body_text[max(0, i - 200): i + 300] if i >= 0 else "",
+        "forms": [{"action": f.get("action"), "inputs": [inp.get("name") for inp in f.find_all("input")]}
+                  for f in soup.find_all("form")][:5],
+    }
+
+
 def scrape_dvf(sku, session=None, name_hint=""):
     """
     Return a dict of product details for one SKU, or found=False.
@@ -303,7 +334,7 @@ def scrape_dvf(sku, session=None, name_hint=""):
             except requests.RequestException as e:
                 tried.append(f"{q}: failed")
                 continue
-            out["search_url"] = sresp.url
+            out.setdefault("search_url", sresp.url)
             psoup, pname = _product_page(sresp)
             if psoup is not None and (sku in (_meta(psoup, "og:image") or "") or sku in sresp.text):
                 resp, soup, name = sresp, psoup, pname
@@ -314,7 +345,7 @@ def scrape_dvf(sku, session=None, name_hint=""):
                 continue
             candidates = _search_links(sresp.text, sresp.url)
             any_results = any_results or bool(candidates)
-            tried.append(f"{q}: {len(candidates)} result(s)")
+            tried.append(f"{q}: {len(candidates)} result(s) — {sresp.url}")
             for link in candidates[:6]:
                 time.sleep(DVF_DELAY)
                 try:

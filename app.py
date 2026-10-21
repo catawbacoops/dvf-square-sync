@@ -444,6 +444,18 @@ def newitems_probe():
     return jsonify(newitems.scrape_dvf(sku, name_hint=hint))
 
 
+@app.route("/api/newitems/debug_search")
+def newitems_debug_search():
+    """Show what DVF's search returns to the server. ?q=633006"""
+    q = request.args.get("q", "").strip()
+    if not q:
+        return jsonify({"error": "add ?q=SKU"}), 400
+    try:
+        return jsonify(newitems.debug_search(q))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/newitems/lookup", methods=["POST"])
 def newitems_lookup():
     body = request.get_json(silent=True) or {}
