@@ -107,6 +107,7 @@ def public_state():
             "missing_at": STATE["missing_at"],
             "results": STATE["results"],
             "job": STATE["job"],
+            "weights_file": STATE.get("weights_file") if WEIGHTS_FILE.exists() else None,
         })
 
 
@@ -1038,6 +1039,87 @@ def start_fix_categories(base, headers, timeout, skus):
         return False, "Enter one or more SKUs."
     threading.Thread(target=_guarded(_fix_cats_worker), args=(clean, base, headers, timeout), daemon=True).start()
     return True, f"Fixing categories for {len(clean)} SKU(s)…"
+
+
+WEIGHTS_FILE = Path("/tmp/dvf_new_item_weights.xlsx")
+TO_LB = {"lb": 1.0, "lbs": 1.0, "oz": 1 / 16, "ounce": 1 / 16, "ounces": 1 / 16,
+         "kg": 2.20462, "g": 0.00220462}
+
+
+def _to_unit(value, unit, target):
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    lb = v * TO_LB.get((unit or "lb").lower(), 1.0)
+    return round(lb if target == "lb" else lb / 2.20462, 3)
+
+
+def _weights_worker(skus, base, headers, timeout, unit):
+    """Build a Square item-library import file that sets weight on these SKUs only."""
+    from openpyxl import Workbook
+    total = len(skus)
+    _job(phase="create", done=0, total=total, message="Building weight import file…", log=[])
+    items = _square_list(base, headers, timeout, "ITEM")
+    by_sku = {}
+    for it in items:
+        idata = it.get("item_data", {})
+        for v in idata.get("variations", []):
+            vd = v.get("item_variation_data", {})
+            k = vd.get("sku", "").strip().upper()
+            if k:
+                by_sku[k] = (v["id"], idata.get("name", ""), vd.get("name", ""), k)
+    session = requests.Session()
+    rows, notes = [], []
+    for i, sku in enumerate(skus, 1):
+        if sku not in by_sku:
+            notes.append(f"{sku}: not in Square")
+            _job(done=i)
+            continue
+        res = next((r for r in STATE["results"] if r["sku"] == sku and r.get("weight")), None)
+        if res is None:
+            res = scrape_dvf(sku, session=session)
+            time.sleep(DVF_DELAY)
+        w = _to_unit(res.get("weight"), res.get("weight_unit"), unit)
+        if not w:
+            notes.append(f"{sku}: no weight on DVF")
+        else:
+            token, iname, vname, k = by_sku[sku]
+            rows.append([token, iname, vname, k, w])
+        _job(done=i)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Items"
+    ws.append(["Token", "Item Name", "Variation Name", "SKU", f"Weight ({unit})"])
+    for r in rows:
+        ws.append(r)
+    for col, width in zip("ABCDE", (30, 50, 18, 12, 12)):
+        ws.column_dimensions[col].width = width
+    wb.save(WEIGHTS_FILE)
+    with _lock:
+        STATE["weights_file"] = {"at": time.strftime("%Y-%m-%d %H:%M"), "count": len(rows), "unit": unit}
+    msg = f"⚖️ Weight import file ready: {len(rows)} item(s)."
+    if notes:
+        msg += " Skipped: " + "; ".join(notes[:15]) + ("…" if len(notes) > 15 else "")
+    _job(phase="review" if STATE["results"] else "idle", message=msg)
+
+
+def start_weights(base, headers, timeout, skus=None, unit="lb"):
+    if job_busy():
+        return False, "A job is already running."
+    clean = []
+    for x in skus or []:
+        x = re.sub(r"\s", "", str(x)).upper()
+        if x and x not in clean:
+            clean.append(x)
+    if not clean:
+        clean = [r["sku"] for r in STATE["results"] if r.get("square_id")]
+    if not clean:
+        return False, "No new items created yet. Enter SKUs in the box to make a weight file for them."
+    unit = "kg" if unit == "kg" else "lb"
+    threading.Thread(target=_guarded(_weights_worker), args=(clean, base, headers, timeout, unit),
+                     daemon=True).start()
+    return True, f"Building weight file for {len(clean)} item(s)…"
 
 
 def _create_worker(rows, base, headers, timeout, currency):

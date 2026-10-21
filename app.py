@@ -20,7 +20,7 @@ from datetime import datetime
 
 import requests
 import pandas as pd
-from flask import Flask, request, jsonify, render_template_string, Response
+from flask import Flask, request, jsonify, render_template_string, Response, send_file
 
 import newitems
 import catmatch
@@ -540,6 +540,27 @@ def newitems_fix_categories():
     return jsonify({"status": "ok" if ok else "error", "message": msg}), (200 if ok else 409)
 
 
+@app.route("/api/newitems/weights", methods=["POST"])
+def newitems_weights():
+    if not SQUARE_ACCESS_TOKEN:
+        return jsonify({"status": "error", "message": "SQUARE_ACCESS_TOKEN not configured."}), 500
+    body = request.get_json(silent=True) or {}
+    skus = body.get("skus") or []
+    if isinstance(skus, str):
+        skus = re.split(r"[,\s]+", skus)
+    ok, msg = newitems.start_weights(SQUARE_BASE_URL, SQUARE_HEADERS, SQUARE_TIMEOUT,
+                                     [x for x in skus if x], body.get("unit", "lb"))
+    return jsonify({"status": "ok" if ok else "error", "message": msg}), (200 if ok else 409)
+
+
+@app.route("/api/newitems/weights.xlsx")
+def newitems_weights_file():
+    if not newitems.WEIGHTS_FILE.exists():
+        return jsonify({"error": "No weight file yet."}), 404
+    return send_file(newitems.WEIGHTS_FILE, as_attachment=True,
+                     download_name="square_import_new_item_weights.xlsx")
+
+
 @app.route("/api/newitems/create", methods=["POST"])
 def newitems_create():
     if not SQUARE_ACCESS_TOKEN:
@@ -883,6 +904,14 @@ HTML = '''<!DOCTYPE html>
       <button class="btn" onclick="niFixSkus()">🖼 Add Images</button>
       <button class="btn" onclick="niFixCats()">📁 Fix Categories</button>
     </div>
+    <div class="btn-row">
+      <button class="btn" onclick="niWeights()">⚖️ Make Weight Import File</button>
+      <a class="btn green" id="ni-wfile" href="/api/newitems/weights.xlsx" style="display:none;text-decoration:none">⬇ Download Weight File</a>
+    </div>
+    <div class="ni-status" style="font-size:11px;margin-top:-4px">
+      Square's API can't set shipping weight. This makes a file for just the new items
+      (or the SKUs typed above) — import it in Square Dashboard: Items → Item library → Actions → Import library.
+    </div>
     <div class="ni-tools" id="ni-tools">
       <label><input type="checkbox" id="ni-all" onchange="niToggleAll(this.checked)"> Select all</label>
       <span id="ni-count"></span>
@@ -1068,6 +1097,9 @@ HTML = '''<!DOCTYPE html>
 
     document.getElementById('ni-lookup').disabled = busy || !s.missing_count;
     document.getElementById('ni-csv').style.display = s.missing_count ? '' : 'none';
+    const wf = document.getElementById('ni-wfile');
+    wf.style.display = s.weights_file && !busy ? 'flex' : 'none';
+    if (s.weights_file) wf.textContent = `⬇ Download Weight File (${s.weights_file.count} items, ${s.weights_file.at})`;
     const nf = (s.results || []).filter(r => !r.found && !r.square_id).length;
     const rb = document.getElementById('ni-retry');
     rb.style.display = nf && !busy ? 'flex' : 'none';
@@ -1152,6 +1184,14 @@ HTML = '''<!DOCTYPE html>
     if (!v) return;
     if (!confirm('Move these items to the category matching DVF (creating subcategories if needed)?')) return;
     const r = await fetch('/api/newitems/fix_categories', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({skus: v})});
+    const d = await r.json().catch(() => ({message: 'Server error'}));
+    if (d.status !== 'ok') alert(d.message);
+    niRefresh();
+  }
+
+  async function niWeights() {
+    const v = document.getElementById('ni-fixskus').value.trim();
+    const r = await fetch('/api/newitems/weights', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({skus: v})});
     const d = await r.json().catch(() => ({message: 'Server error'}));
     if (d.status !== 'ok') alert(d.message);
     niRefresh();
