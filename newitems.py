@@ -310,6 +310,7 @@ query ($sku: String!) {
   site {
     product(sku: $sku) {
       entityId name sku path upc
+      weight { value unit }
       brand { name }
       plainTextDescription(characterLimit: 4000)
       defaultImage { url(width: 1280) }
@@ -438,6 +439,8 @@ def scrape_dvf(sku, session=None, name_hint=""):
             "breadcrumb": " / ".join(cats), "availability": "",
             "sku_verified": True,
             "dvf_paths": _dvf_paths(prod),
+            "weight": (prod.get("weight") or {}).get("value"),
+            "weight_unit": (prod.get("weight") or {}).get("unit", ""),
         })
         if out["name"]:
             return out
