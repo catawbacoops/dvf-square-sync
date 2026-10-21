@@ -262,7 +262,14 @@ def _product_page(resp):
     return soup, name
 
 
-def scrape_dvf(sku, session=None):
+def _name_query(desc):
+    """'Jordan Almonds NR3 12/11oz' -> 'Jordan Almonds NR3' (drop pack/size tokens)."""
+    t = re.sub(r"\b\d+\s*/\s*[\d.]+\s*\w*\b", " ", desc or "")
+    t = re.sub(r"\b[\d.]+\s*(oz|lb|lbs|ct|g|kg|ml|l|gal|pc|pk)\b", " ", t, flags=re.I)
+    return re.sub(r"\s+", " ", t).strip()
+
+
+def scrape_dvf(sku, session=None, name_hint=""):
     """
     Return a dict of product details for one SKU, or found=False.
     Tries the direct /products/details/<SKU> page first; if that is
@@ -281,36 +288,53 @@ def scrape_dvf(sku, session=None):
         out["error"] = f"request failed: {e}"
 
     if soup is None:
-        # Fallback: site search
-        try:
-            sresp = _fetch(s, DVF_SEARCH_URL, params={"search_query": sku})
+        # Fallback: site search — SKU, SKU without leading zeros, then name
+        queries = [sku]
+        if sku.lstrip("0") and sku.lstrip("0") != sku:
+            queries.append(sku.lstrip("0"))
+        nq = _name_query(name_hint)
+        if nq and len(nq) >= 4:
+            queries.append(nq)
+        tried = []
+        any_results = False
+        for q in queries:
+            try:
+                sresp = _fetch(s, DVF_SEARCH_URL, params={"search_query": q})
+            except requests.RequestException as e:
+                tried.append(f"{q}: failed")
+                continue
             out["search_url"] = sresp.url
-            # Some searches jump straight to the product page
-            soup, name = _product_page(sresp)
-            if soup is not None:
-                resp = sresp
-                out["method"] = "search (direct hit)"
-            elif sresp.status_code == 200:
-                candidates = _search_links(sresp.text, sresp.url)
-                out["search_results"] = len(candidates)
-                for link in candidates[:5]:
-                    time.sleep(DVF_DELAY)
+            psoup, pname = _product_page(sresp)
+            if psoup is not None and (sku in (_meta(psoup, "og:image") or "") or sku in sresp.text):
+                resp, soup, name = sresp, psoup, pname
+                out["method"] = f"search '{q}' (direct hit)"
+                break
+            if sresp.status_code != 200:
+                tried.append(f"{q}: HTTP {sresp.status_code}")
+                continue
+            candidates = _search_links(sresp.text, sresp.url)
+            any_results = any_results or bool(candidates)
+            tried.append(f"{q}: {len(candidates)} result(s)")
+            for link in candidates[:6]:
+                time.sleep(DVF_DELAY)
+                try:
                     presp = _fetch(s, link)
-                    psoup, pname = _product_page(presp)
-                    if psoup is None:
-                        continue
-                    pimg = _meta(psoup, "og:image")
-                    if sku in (pimg or "") or sku in presp.text:
-                        resp, soup, name = presp, psoup, pname
-                        out["method"] = "search"
-                        break
-                if soup is None:
-                    out["error"] = ("search found no matching product" if candidates
-                                    else "no search results on DVF")
-            else:
-                out["error"] = f"search HTTP {sresp.status_code}"
-        except requests.RequestException as e:
-            out["error"] = f"search failed: {e}"
+                except requests.RequestException:
+                    continue
+                psoup, pname = _product_page(presp)
+                if psoup is None:
+                    continue
+                if sku in (_meta(psoup, "og:image") or "") or sku in presp.text:
+                    resp, soup, name = presp, psoup, pname
+                    out["method"] = f"search '{q}'"
+                    break
+            if soup is not None:
+                break
+            time.sleep(DVF_DELAY)
+        out["searches"] = tried
+        if soup is None:
+            out["error"] = ("searched DVF, no page shows this SKU" if any_results
+                            else "no search results on DVF")
 
     if soup is None:
         return out
@@ -350,7 +374,7 @@ def _lookup_worker(rows):
     total = len(rows)
     _job(phase="lookup", done=0, total=total, message="Looking up items on DVF…", log=[])
     for i, row in enumerate(rows, 1):
-        info = scrape_dvf(row["sku"], session=session)
+        info = scrape_dvf(row["sku"], session=session, name_hint=row.get("list_desc", ""))
         merged = dict(row)
         merged.update(info)
         if not info.get("found"):
@@ -379,7 +403,7 @@ def _retry_worker(rows):
     _job(phase="lookup", done=0, total=total, message="Retrying items not found…", log=[])
     for i, row in enumerate(rows, 1):
         base = next((m for m in STATE["missing"] if m["sku"] == row["sku"]), row)
-        info = scrape_dvf(row["sku"], session=session)
+        info = scrape_dvf(row["sku"], session=session, name_hint=base.get("list_desc", ""))
         merged = dict(base)
         merged.update(info)
         if not info.get("found"):

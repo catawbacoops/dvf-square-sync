@@ -439,7 +439,9 @@ def newitems_probe():
     sku = re.sub(r"\s", "", request.args.get("sku", "")).upper()
     if not sku:
         return jsonify({"error": "add ?sku=XXXXXX"}), 400
-    return jsonify(newitems.scrape_dvf(sku))
+    hint = next((m.get("list_desc", "") for m in newitems.STATE["missing"] if m["sku"] == sku),
+                request.args.get("name", ""))
+    return jsonify(newitems.scrape_dvf(sku, name_hint=hint))
 
 
 @app.route("/api/newitems/lookup", methods=["POST"])
