@@ -20,7 +20,9 @@ from datetime import datetime
 
 import requests
 import pandas as pd
-from flask import Flask, request, jsonify, render_template_string
+from flask import Flask, request, jsonify, render_template_string, Response
+
+import newitems
 
 # ---------------------------------------------------------------------------
 # Config from environment variables
@@ -190,10 +192,13 @@ def read_price_list(file_storage):
 
     Columns:
       0  = SKU (format "123 456" -> strip space -> "123456")
+      1  = Description
       2  = Case price
       4  = Unit price
       6  = Suggested retail
       8  = GP%
+      11 = Case UPC
+      12 = Retail UPC
     """
     filename = file_storage.filename or ""
     suffix   = Path(filename).suffix.lower()
@@ -206,9 +211,16 @@ def read_price_list(file_storage):
         engine = "xlrd" if suffix == ".xls" else "openpyxl"
         df = pd.read_excel(tmp_path, header=None, dtype=str, engine=engine)
 
+        # Section headers (e.g. "AMISH ORIGINS / SALVES & SOAPS") are rows with
+        # a description but no SKU and no price. Carry each one down to its items.
+        body = df.iloc[4:].copy()
+        is_header = body[0].isna() & body[1].notna() & body[2].isna()
+        body["section"] = body[1].where(is_header).ffill().str.strip()
+
         # Take only the columns we need
-        data = df.iloc[4:, [0, 2, 4, 6, 8]].copy()
-        data.columns = ["sku", "case_price", "unit_price", "sug_retail", "gp_pct"]
+        data = body[[0, 1, 2, 4, 6, 8, 11, 12, "section"]].copy()
+        data.columns = ["sku", "desc", "case_price", "unit_price", "sug_retail",
+                        "gp_pct", "case_upc", "retail_upc", "section"]
 
         # Drop category header rows (no SKU or no price)
         data = data.dropna(subset=["sku", "unit_price"])
@@ -399,11 +411,52 @@ def sync_prices():
         messages.append(f"🔗  Loaded {len(sku_map)} SKUs from Square.")
 
         messages += update_prices(df, sku_map)
+
+        n_missing = newitems.record_missing(df, sku_map)
+        if n_missing:
+            messages.append(f"🆕  {n_missing} new SKU(s) saved — use New Items below to look them up on DVF.")
         return jsonify({"status": "ok", "messages": messages})
 
     except Exception as e:
         log.exception("Price sync error")
         return jsonify({"status": "error", "messages": [f"❌  Error: {str(e)}"]}), 500
+
+
+@app.route("/api/newitems/state")
+def newitems_state():
+    return jsonify(newitems.public_state())
+
+
+@app.route("/api/newitems/missing.csv")
+def newitems_missing_csv():
+    return Response(newitems.missing_csv(), mimetype="text/csv",
+                    headers={"Content-Disposition": "attachment; filename=new_skus_not_in_square.csv"})
+
+
+@app.route("/api/newitems/probe")
+def newitems_probe():
+    """Look up one SKU on DVF without changing anything. ?sku=005030"""
+    sku = re.sub(r"\s", "", request.args.get("sku", "")).upper()
+    if not sku:
+        return jsonify({"error": "add ?sku=XXXXXX"}), 400
+    return jsonify(newitems.scrape_dvf(sku))
+
+
+@app.route("/api/newitems/lookup", methods=["POST"])
+def newitems_lookup():
+    body = request.get_json(silent=True) or {}
+    ok, msg = newitems.start_lookup(body.get("skus"))
+    return jsonify({"status": "ok" if ok else "error", "message": msg}), (200 if ok else 409)
+
+
+@app.route("/api/newitems/create", methods=["POST"])
+def newitems_create():
+    if not SQUARE_ACCESS_TOKEN:
+        return jsonify({"status": "error", "message": "SQUARE_ACCESS_TOKEN not configured."}), 500
+    body = request.get_json(silent=True) or {}
+    skus = body.get("skus") or []
+    ok, msg = newitems.start_create(skus, SQUARE_BASE_URL, SQUARE_HEADERS, SQUARE_TIMEOUT, CURRENCY)
+    return jsonify({"status": "ok" if ok else "error", "message": msg}), (200 if ok else 409)
 
 
 @app.route("/health")
@@ -614,6 +667,30 @@ HTML = '''<!DOCTYPE html>
     display: none;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+
+  .container.wide { max-width: 680px; }
+  .ni-status { font-family: var(--mono); font-size: 12px; color: var(--muted); margin-bottom: 14px; line-height: 1.7; }
+  .ni-status b { color: var(--text); font-weight: 500; }
+  .progress { height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; margin-bottom: 14px; display: none; }
+  .progress > div { height: 100%; width: 0; background: var(--blue); transition: width .4s; }
+  .btn-row { display: flex; gap: 8px; margin-bottom: 10px; }
+  .btn-row .btn { flex: 1; }
+  .link { color: var(--blue); font-size: 12px; font-family: var(--mono); text-decoration: none; }
+  .link:hover { text-decoration: underline; }
+  .ni-tools { display: none; align-items: center; justify-content: space-between; gap: 8px; margin: 14px 0 8px; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+  .ni-tools label { display: flex; gap: 6px; align-items: center; cursor: pointer; }
+  .ni-table { display: none; max-height: 520px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 14px; }
+  .ni-table table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .ni-table th { position: sticky; top: 0; background: var(--surface); text-align: left; padding: 8px; font-family: var(--mono); font-weight: 500; color: var(--muted); border-bottom: 1px solid var(--border); }
+  .ni-table td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: top; }
+  .ni-table tr.off td { opacity: .45; }
+  .ni-table img { width: 48px; height: 48px; object-fit: contain; background: #fff; border-radius: 4px; }
+  .ni-name { font-weight: 500; }
+  .ni-sub { color: var(--muted); font-size: 11px; margin-top: 3px; font-family: var(--mono); }
+  .ni-flag { color: var(--amber); }
+  .ni-bad { color: var(--red); }
+  .ni-ok { color: var(--green); }
+  .ni-price { font-family: var(--mono); white-space: nowrap; }
 </style>
 </head>
 <body>
@@ -681,6 +758,40 @@ HTML = '''<!DOCTYPE html>
             style="background:var(--blue-dim);border-color:#3b82f655;color:var(--blue)">
       <div class="spinner" id="spin-price"></div>
       <span id="btn-price-label">▶ Run Price Update</span>
+    </button>
+  </div>
+
+  <!-- New Items -->
+  <div class="card">
+    <div class="card-title">🆕 New Items</div>
+    <div class="card-desc">
+      SKUs from the last Price Update that aren't in Square. Look them up on
+      dutchvalleyfoods.com, review what was found, then create the ones you want.
+      Prices use <strong style="color:var(--blue)">Case Price ÷ (1 - GP%)</strong>.
+    </div>
+    <div class="tags">
+      <span class="tag green">Creates items</span>
+      <span class="tag">Name · description · image · category</span>
+    </div>
+    <div class="ni-status" id="ni-status">Loading…</div>
+    <div class="progress" id="ni-progress"><div></div></div>
+    <div class="btn-row">
+      <button class="btn" id="ni-lookup" onclick="niLookup()" disabled
+              style="background:var(--blue-dim);border-color:#3b82f655;color:var(--blue)">🔎 Look Up on DVF</button>
+      <a class="btn" id="ni-csv" href="/api/newitems/missing.csv" style="text-decoration:none">⬇ SKU List (CSV)</a>
+    </div>
+    <div class="ni-tools" id="ni-tools">
+      <label><input type="checkbox" id="ni-all" onchange="niToggleAll(this.checked)"> Select all</label>
+      <span id="ni-count"></span>
+    </div>
+    <div class="ni-table" id="ni-table">
+      <table>
+        <thead><tr><th></th><th></th><th>Item</th><th>Price</th></tr></thead>
+        <tbody id="ni-rows"></tbody>
+      </table>
+    </div>
+    <button class="btn green" id="ni-create" onclick="niCreate()" style="display:none" disabled>
+      ✅ Create Selected in Square
     </button>
   </div>
 
@@ -779,6 +890,7 @@ HTML = '''<!DOCTYPE html>
       const r    = await fetch('/api/sync/prices', {method: 'POST', body: formData});
       const data = await r.json();
       showResults(data.messages || [], data.status === 'error');
+      niRefresh();
     } catch(e) {
       showResults(['❌ Network error: ' + e.message], true);
     } finally {
@@ -799,25 +911,125 @@ HTML = '''<!DOCTYPE html>
       return `<div class="result-line ${cls}">${m}</div>`;
     }).join('');
     el.scrollIntoView({behavior: 'smooth'});
-
-    // Drag and drop
-    ['oos', 'disc'].forEach(type => {
-      const dz = document.getElementById('dz-' + type);
-      dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dragover'); });
-      dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
-      dz.addEventListener('drop', e => {
-        e.preventDefault();
-        dz.classList.remove('dragover');
-        const file = e.dataTransfer.files[0];
-        if (file) {
-          files[type] = file;
-          document.getElementById('fn-' + type).style.display = 'block';
-          document.getElementById('fn-' + type).textContent = '📄 ' + file.name;
-          document.getElementById('btn-' + type).disabled = false;
-        }
-      });
-    });
   }
+
+  // Drag and drop (registered once, for all three upload boxes)
+  ['oos', 'price', 'disc'].forEach(type => {
+    const dz = document.getElementById('dz-' + type);
+    dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dragover'); });
+    dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
+    dz.addEventListener('drop', e => {
+      e.preventDefault();
+      dz.classList.remove('dragover');
+      const file = e.dataTransfer.files[0];
+      if (file) {
+        files[type] = file;
+        document.getElementById('fn-' + type).style.display = 'block';
+        document.getElementById('fn-' + type).textContent = '📄 ' + file.name;
+        document.getElementById('btn-' + type).disabled = false;
+      }
+    });
+  });
+
+  // ---------------- New Items ----------------
+  let niState = null, niTimer = null;
+  const niSel = new Set();
+  const esc = t => String(t ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+  async function niRefresh() {
+    try {
+      const r = await fetch('/api/newitems/state');
+      niState = await r.json();
+    } catch (e) { return; }
+    niRender();
+    const busy = ['lookup', 'create'].includes(niState.job.phase);
+    clearTimeout(niTimer);
+    if (busy) niTimer = setTimeout(niRefresh, 2000);
+  }
+
+  function niRender() {
+    const s = niState, j = s.job;
+    const busy = ['lookup', 'create'].includes(j.phase);
+    const st = document.getElementById('ni-status');
+    let html = s.missing_count
+      ? `<b>${s.missing_count}</b> SKU(s) not in Square from the price update at ${esc(s.missing_at)}.`
+      : 'No new SKUs yet. Run a Price Update first.';
+    if (j.phase === 'lookup') html += `<br>Looking up on DVF… <b>${j.done} / ${j.total}</b>`;
+    if (j.phase === 'create') html += `<br>Creating in Square… <b>${j.done} / ${j.total}</b>`;
+    if (j.message && !busy) html += `<br>${esc(j.message)}`;
+    st.innerHTML = html;
+
+    const pg = document.getElementById('ni-progress');
+    pg.style.display = busy ? 'block' : 'none';
+    pg.firstElementChild.style.width = j.total ? (100 * j.done / j.total) + '%' : '0';
+
+    document.getElementById('ni-lookup').disabled = busy || !s.missing_count;
+    document.getElementById('ni-csv').style.display = s.missing_count ? '' : 'none';
+
+    const rows = s.results || [];
+    const show = rows.length > 0;
+    document.getElementById('ni-table').style.display = show ? 'block' : 'none';
+    document.getElementById('ni-tools').style.display = show ? 'flex' : 'none';
+    document.getElementById('ni-create').style.display = show ? 'flex' : 'none';
+
+    if (j.phase !== 'create' && !niRender.seeded && j.phase === 'review') {
+      niSel.clear(); rows.forEach(r => { if (r.selected) niSel.add(r.sku); });
+      niRender.seeded = true;
+    }
+    if (busy) niRender.seeded = false;
+
+    document.getElementById('ni-rows').innerHTML = rows.map(r => {
+      const created = r.square_id;
+      const on = niSel.has(r.sku) && !created;
+      let sub = `SKU ${esc(r.sku)}`;
+      if (r.section) sub += ` · ${esc(r.section)}`;
+      let flag = '';
+      if (r.status) flag = `<div class="ni-sub ${created ? 'ni-ok' : 'ni-bad'}">${esc(r.status)}</div>`;
+      else if (!r.found) flag = `<div class="ni-sub ni-bad">Not found on DVF — ${esc(r.error || '')}. Name is from the price list.</div>`;
+      else if (!r.sku_verified) flag = `<div class="ni-sub ni-flag">Check: page didn't clearly show this SKU</div>`;
+      const desc = r.description ? `<div class="ni-sub" style="font-family:var(--sans)">${esc(r.description.slice(0, 140))}${r.description.length > 140 ? '…' : ''}</div>` : '';
+      const link = r.found ? ` · <a class="link" href="${esc(r.final_url || r.url)}" target="_blank">DVF ↗</a>` : '';
+      return `<tr class="${on || created ? '' : 'off'}">
+        <td><input type="checkbox" ${on ? 'checked' : ''} ${created || busy ? 'disabled' : ''} onchange="niPick('${esc(r.sku)}', this.checked)"></td>
+        <td>${r.image ? `<img src="${esc(r.image)}" loading="lazy" alt="">` : ''}</td>
+        <td><div class="ni-name">${esc(r.name || r.list_desc)}</div><div class="ni-sub">${sub}${link}</div>${desc}${flag}</td>
+        <td class="ni-price">${r.retail ? '$' + Number(r.retail).toFixed(2) : '<span class="ni-bad">—</span>'}<div class="ni-sub">case $${esc(r.case_price)} · ${esc(r.gp_pct)}</div></td>
+      </tr>`;
+    }).join('');
+
+    const avail = rows.filter(r => !r.square_id).length;
+    const n = [...niSel].filter(k => rows.some(r => r.sku === k && !r.square_id)).length;
+    document.getElementById('ni-count').textContent = `${n} of ${avail} selected`;
+    document.getElementById('ni-all').checked = avail > 0 && n === avail;
+    document.getElementById('ni-create').disabled = busy || n === 0;
+  }
+
+  function niPick(sku, on) { on ? niSel.add(sku) : niSel.delete(sku); niRender(); }
+  function niToggleAll(on) {
+    (niState.results || []).forEach(r => { if (!r.square_id) on ? niSel.add(r.sku) : niSel.delete(r.sku); });
+    niRender();
+  }
+
+  async function niLookup() {
+    niRender.seeded = false;
+    const r = await fetch('/api/newitems/lookup', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+    const d = await r.json().catch(() => ({message: 'Server error'}));
+    if (d.status !== 'ok') alert(d.message);
+    niRefresh();
+  }
+
+  async function niCreate() {
+    const rows = niState.results || [];
+    const skus = [...niSel].filter(k => rows.some(r => r.sku === k && !r.square_id));
+    if (!skus.length) return;
+    if (!confirm(`Create ${skus.length} new item(s) in Square? They will be sellable immediately.`)) return;
+    const r = await fetch('/api/newitems/create', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({skus})});
+    const d = await r.json().catch(() => ({message: 'Server error'}));
+    if (d.status !== 'ok') alert(d.message);
+    niRefresh();
+  }
+
+  niRefresh();
 </script>
 </body>
 </html>'''
