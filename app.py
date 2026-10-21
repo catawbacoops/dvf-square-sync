@@ -222,11 +222,13 @@ def read_price_list(file_storage):
             data["gp_pct"].str.replace("%", "").str.strip(), errors="coerce"
         ) / 100
 
-        # Case price as float
-        data["case_price_num"] = pd.to_numeric(data["case_price"], errors="coerce")
+        # Unit price as float (column 4 = per-each price; column 2 is the CASE price)
+        data["unit_price_num"] = pd.to_numeric(data["unit_price"], errors="coerce")
 
-        # Calculate retail = case_price / (1 - gp%)
-        data["retail_calc"] = (data["case_price_num"] / (1 - data["gp_clean"])).round(2)
+        # Calculate retail = unit_price / (1 - gp%)
+        # Guard against GP% >= 100% (would divide by zero or go negative)
+        data.loc[data["gp_clean"] >= 1, "gp_clean"] = float("nan")
+        data["retail_calc"] = (data["unit_price_num"] / (1 - data["gp_clean"])).round(2)
 
         # Drop rows where calculation failed
         data = data.dropna(subset=["retail_calc"])
