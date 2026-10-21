@@ -269,6 +269,101 @@ def _name_query(desc):
     return re.sub(r"\s+", " ", t).strip()
 
 
+# ---------------------------------------------------------------------------
+# BigCommerce lookups that don't depend on the site's JavaScript search
+# ---------------------------------------------------------------------------
+
+_SF = {"token": None, "checked": False}
+_JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")
+
+
+def storefront_token(session=None, force=False):
+    """Find the public BigCommerce storefront API token embedded in DVF pages."""
+    if _SF["checked"] and not force:
+        return _SF["token"]
+    s = session or requests
+    tok = None
+    for url in (DVF_BASE + "/", DVF_SEARCH_URL + "?search_query=flour"):
+        try:
+            r = _fetch(s, url)
+        except requests.RequestException:
+            continue
+        for m in _JWT_RE.findall(r.text):
+            try:
+                import base64
+                part = m.split(".")[1]
+                payload = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+            except Exception:
+                continue
+            # Storefront tokens carry a cors / channel claim
+            if any(k in payload for k in ("cors", "cid", "eat", "sub_type")):
+                tok = m
+                break
+        if tok:
+            break
+    _SF.update(token=tok, checked=True)
+    return tok
+
+
+GQL_PRODUCT = """
+query ($sku: String!) {
+  site {
+    product(sku: $sku) {
+      entityId name sku path upc
+      brand { name }
+      plainTextDescription(characterLimit: 4000)
+      defaultImage { url(width: 1280) }
+      categories { edges { node { name path } } }
+    }
+  }
+}"""
+
+
+def gql_product(sku, session=None):
+    """Exact-SKU lookup through the BigCommerce storefront GraphQL API."""
+    tok = storefront_token(session)
+    if not tok:
+        return None, "no storefront token on DVF pages"
+    s = session or requests
+    try:
+        r = s.post(DVF_BASE + "/graphql", timeout=DVF_TIMEOUT,
+                   headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json",
+                            "Origin": DVF_BASE, "User-Agent": DVF_HEADERS["User-Agent"]},
+                   json={"query": GQL_PRODUCT, "variables": {"sku": sku}})
+    except requests.RequestException as e:
+        return None, f"graphql request failed: {e}"
+    if r.status_code != 200:
+        return None, f"graphql HTTP {r.status_code}"
+    try:
+        d = r.json()
+    except ValueError:
+        return None, "graphql returned non-JSON"
+    if d.get("errors"):
+        return None, "graphql error: " + str(d["errors"])[:200]
+    prod = (d.get("data") or {}).get("site", {}).get("product")
+    return prod, ("" if prod else "graphql: no product with this SKU")
+
+
+def quick_search_links(q, session=None):
+    """BigCommerce Stencil quick-search fragment (what the type-ahead box uses)."""
+    s = session or requests
+    links = []
+    for tpl in ("search/quick-results", "search/product-listing", "components/search/product-listing"):
+        try:
+            r = s.get(DVF_SEARCH_URL, params={"search_query": q}, timeout=DVF_TIMEOUT,
+                      headers=dict(DVF_HEADERS, **{
+                          "stencil-config": "{}",
+                          "stencil-options": json.dumps({"render_with": tpl}),
+                          "X-Requested-With": "XMLHttpRequest"}))
+        except requests.RequestException:
+            continue
+        if r.status_code == 200 and len(r.text) < 400000:
+            links = _search_links(r.text, r.url)
+            if links:
+                return links, tpl
+    return links, ""
+
+
 def debug_search(q):
     """What the server actually receives from DVF's search for q."""
     from urllib.parse import urljoin
@@ -282,7 +377,15 @@ def debug_search(q):
     scripts = [sc.get("src") for sc in soup.find_all("script", src=True)]
     body_text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
     i = body_text.lower().find("result")
+    tok = storefront_token(force=True)
+    prod, gql_err = gql_product(q)
+    qlinks, qtpl = quick_search_links(q)
     return {
+        "storefront_token_found": bool(tok),
+        "graphql_product": prod,
+        "graphql_error": gql_err,
+        "quick_search_template": qtpl,
+        "quick_search_links": qlinks[:10],
         "query": q,
         "status": r.status_code,
         "final_url": r.url,
@@ -319,7 +422,53 @@ def scrape_dvf(sku, session=None, name_hint=""):
         out["error"] = f"request failed: {e}"
 
     if soup is None:
-        # Fallback: site search — SKU, SKU without leading zeros, then name
+        # 1) Exact SKU through BigCommerce's storefront API
+        prod, gql_err = gql_product(sku, session=s)
+        out["graphql"] = gql_err or "found"
+        if prod and prod.get("path"):
+            try:
+                presp = _fetch(s, DVF_BASE + prod["path"])
+                psoup, pname = _product_page(presp)
+                if psoup is not None:
+                    resp, soup, name = presp, psoup, pname
+                    out["method"] = "storefront API"
+            except requests.RequestException:
+                pass
+            if soup is None:
+                # Page fetch failed but the API gave us the data — use it directly
+                img = (prod.get("defaultImage") or {}).get("url", "")
+                cats = [e["node"]["name"] for e in (prod.get("categories") or {}).get("edges", [])]
+                out.update({
+                    "found": True, "method": "storefront API (data only)",
+                    "final_url": DVF_BASE + prod["path"], "name": prod.get("name", ""),
+                    "description": _clean_description(prod.get("plainTextDescription", "")),
+                    "image": img, "image_large": img,
+                    "brand": (prod.get("brand") or {}).get("name", ""),
+                    "breadcrumb": " > ".join(cats), "availability": "",
+                    "sku_verified": str(prod.get("sku", "")).strip().upper() == sku,
+                })
+                return out
+
+    if soup is None:
+        # 2) BigCommerce quick-search fragment
+        try:
+            qlinks, qtpl = quick_search_links(sku, session=s)
+        except Exception:
+            qlinks = []
+        for link in qlinks[:6]:
+            time.sleep(DVF_DELAY)
+            try:
+                presp = _fetch(s, link)
+            except requests.RequestException:
+                continue
+            psoup, pname = _product_page(presp)
+            if psoup is not None and (sku in (_meta(psoup, "og:image") or "") or sku in presp.text):
+                resp, soup, name = presp, psoup, pname
+                out["method"] = "quick search"
+                break
+
+    if soup is None:
+        # 3) Fallback: site search — SKU, SKU without leading zeros, then name
         queries = [sku]
         if sku.lstrip("0") and sku.lstrip("0") != sku:
             queries.append(sku.lstrip("0"))
