@@ -35,6 +35,7 @@ log = logging.getLogger(__name__)
 
 DVF_BASE = "https://www.dutchvalleyfoods.com"
 DVF_DETAIL_URL = DVF_BASE + "/products/details/{sku}"
+DVF_SEARCH_URL = DVF_BASE + "/search.php"
 DVF_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
@@ -221,31 +222,101 @@ def _bigger_image(url):
     return re.sub(r"\.\d+\.\d+\.(jpe?g|png|gif)", r".1280.1280.\1", url, flags=re.I)
 
 
-def scrape_dvf(sku, session=None):
-    """Return a dict of product details for one SKU, or found=False."""
-    s = session or requests
-    url = DVF_DETAIL_URL.format(sku=sku)
-    out = {"sku": sku, "found": False, "url": url, "error": ""}
-    try:
-        resp = s.get(url, headers=DVF_HEADERS, timeout=DVF_TIMEOUT, allow_redirects=True)
-    except requests.RequestException as e:
-        out["error"] = f"request failed: {e}"
-        return out
+def _search_links(html, base_url):
+    """Product page links from a DVF search results page, best first."""
+    from urllib.parse import urljoin, urlparse
+    soup = BeautifulSoup(html, "html.parser")
+    skip = ("search.php", "login", "cart", "account", "/categories", "/brands",
+            "wishlist", "compare", "#", "javascript:", "mailto:", "tel:")
+    links, seen = [], set()
+    # Product cards first (BigCommerce: article.card / .card-title / .productGrid)
+    selectors = ["article.card a[href]", ".card-title a[href]", ".productGrid a[href]",
+                 ".productList a[href]", "[data-product-id] a[href]", "[class*='product'] a[href]"]
+    for sel in selectors:
+        for a in soup.select(sel):
+            href = urljoin(base_url, a.get("href", ""))
+            u = urlparse(href)
+            if "dutchvalleyfoods.com" not in u.netloc:
+                continue
+            if any(x in href.lower() for x in skip) or u.path in ("", "/"):
+                continue
+            key = u.scheme + "://" + u.netloc + u.path
+            if key not in seen:
+                seen.add(key); links.append(key)
+    return links
 
-    out["final_url"] = resp.url
-    if resp.status_code == 404:
-        out["error"] = "not on DVF site (404)"
-        return out
+
+def _fetch(s, url, **kw):
+    return s.get(url, headers=DVF_HEADERS, timeout=DVF_TIMEOUT, allow_redirects=True, **kw)
+
+
+def _product_page(resp):
+    """(soup, name) if resp is a product page, else (None, None)."""
     if resp.status_code != 200:
-        out["error"] = f"HTTP {resp.status_code}"
-        return out
-
+        return None, None
     soup = BeautifulSoup(resp.text, "html.parser")
     og_type = _meta(soup, "og:type")
     name = _meta(soup, "og:title") or _text(soup.select_one("h1"))
-    if "search" in resp.url.lower() or (og_type and og_type != "product") or not name:
-        out["error"] = "no product page for this SKU"
+    if "search.php" in resp.url.lower() or (og_type and og_type != "product") or not name:
+        return None, None
+    return soup, name
+
+
+def scrape_dvf(sku, session=None):
+    """
+    Return a dict of product details for one SKU, or found=False.
+    Tries the direct /products/details/<SKU> page first; if that is
+    missing, searches the site for the SKU like a person would.
+    """
+    s = session or requests
+    url = DVF_DETAIL_URL.format(sku=sku)
+    out = {"sku": sku, "found": False, "url": url, "error": "", "method": ""}
+    resp = soup = name = None
+    try:
+        resp = _fetch(s, url)
+        soup, name = _product_page(resp)
+        if soup is not None:
+            out["method"] = "direct"
+    except requests.RequestException as e:
+        out["error"] = f"request failed: {e}"
+
+    if soup is None:
+        # Fallback: site search
+        try:
+            sresp = _fetch(s, DVF_SEARCH_URL, params={"search_query": sku})
+            out["search_url"] = sresp.url
+            # Some searches jump straight to the product page
+            soup, name = _product_page(sresp)
+            if soup is not None:
+                resp = sresp
+                out["method"] = "search (direct hit)"
+            elif sresp.status_code == 200:
+                candidates = _search_links(sresp.text, sresp.url)
+                out["search_results"] = len(candidates)
+                for link in candidates[:5]:
+                    time.sleep(DVF_DELAY)
+                    presp = _fetch(s, link)
+                    psoup, pname = _product_page(presp)
+                    if psoup is None:
+                        continue
+                    pimg = _meta(psoup, "og:image")
+                    if sku in (pimg or "") or sku in presp.text:
+                        resp, soup, name = presp, psoup, pname
+                        out["method"] = "search"
+                        break
+                if soup is None:
+                    out["error"] = ("search found no matching product" if candidates
+                                    else "no search results on DVF")
+            else:
+                out["error"] = f"search HTTP {sresp.status_code}"
+        except requests.RequestException as e:
+            out["error"] = f"search failed: {e}"
+
+    if soup is None:
         return out
+
+    out["final_url"] = resp.url
+    out["error"] = ""
 
     image = _meta(soup, "og:image")
     page_text = resp.text
@@ -299,6 +370,41 @@ def _lookup_worker(rows):
 
     found = sum(1 for r in results if r.get("found"))
     _job(phase="review", message=f"Found {found} of {total} on DVF. Review and create below.")
+
+
+def _retry_worker(rows):
+    """Re-look-up only the given rows and update them in place."""
+    session = requests.Session()
+    total = len(rows)
+    _job(phase="lookup", done=0, total=total, message="Retrying items not found…", log=[])
+    for i, row in enumerate(rows, 1):
+        base = next((m for m in STATE["missing"] if m["sku"] == row["sku"]), row)
+        info = scrape_dvf(row["sku"], session=session)
+        merged = dict(base)
+        merged.update(info)
+        if not info.get("found"):
+            merged["name"] = base.get("list_desc", "")
+        merged["selected"] = bool(info.get("found") and info.get("sku_verified") and merged.get("retail"))
+        with _lock:
+            for j, r in enumerate(STATE["results"]):
+                if r["sku"] == row["sku"]:
+                    STATE["results"][j] = merged
+            STATE["job"]["done"] = i
+        if i % 25 == 0 or i == total:
+            _save()
+        time.sleep(DVF_DELAY)
+    found = sum(1 for r in STATE["results"] if r.get("found"))
+    _job(phase="review", message=f"Found {found} of {len(STATE['results'])} on DVF. Review and create below.")
+
+
+def start_retry_not_found():
+    if job_busy():
+        return False, "A job is already running."
+    rows = [r for r in STATE["results"] if not r.get("found") and not r.get("square_id")]
+    if not rows:
+        return False, "Nothing to retry."
+    threading.Thread(target=_retry_worker, args=(rows,), daemon=True).start()
+    return True, f"Retrying {len(rows)} SKU(s)."
 
 
 def start_lookup(skus=None):

@@ -449,6 +449,12 @@ def newitems_lookup():
     return jsonify({"status": "ok" if ok else "error", "message": msg}), (200 if ok else 409)
 
 
+@app.route("/api/newitems/retry", methods=["POST"])
+def newitems_retry():
+    ok, msg = newitems.start_retry_not_found()
+    return jsonify({"status": "ok" if ok else "error", "message": msg}), (200 if ok else 409)
+
+
 @app.route("/api/newitems/create", methods=["POST"])
 def newitems_create():
     if not SQUARE_ACCESS_TOKEN:
@@ -780,6 +786,9 @@ HTML = '''<!DOCTYPE html>
               style="background:var(--blue-dim);border-color:#3b82f655;color:var(--blue)">🔎 Look Up on DVF</button>
       <a class="btn" id="ni-csv" href="/api/newitems/missing.csv" style="text-decoration:none">⬇ SKU List (CSV)</a>
     </div>
+    <div class="btn-row">
+      <button class="btn amber" id="ni-retry" onclick="niRetry()" style="display:none">↻ Retry Not Found</button>
+    </div>
     <div class="ni-tools" id="ni-tools">
       <label><input type="checkbox" id="ni-all" onchange="niToggleAll(this.checked)"> Select all</label>
       <span id="ni-count"></span>
@@ -965,6 +974,10 @@ HTML = '''<!DOCTYPE html>
 
     document.getElementById('ni-lookup').disabled = busy || !s.missing_count;
     document.getElementById('ni-csv').style.display = s.missing_count ? '' : 'none';
+    const nf = (s.results || []).filter(r => !r.found && !r.square_id).length;
+    const rb = document.getElementById('ni-retry');
+    rb.style.display = nf && !busy ? 'flex' : 'none';
+    rb.textContent = `↻ Retry ${nf} Not Found`;
 
     const rows = s.results || [];
     const show = rows.length > 0;
@@ -1013,6 +1026,13 @@ HTML = '''<!DOCTYPE html>
   async function niLookup() {
     niRender.seeded = false;
     const r = await fetch('/api/newitems/lookup', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'});
+    const d = await r.json().catch(() => ({message: 'Server error'}));
+    if (d.status !== 'ok') alert(d.message);
+    niRefresh();
+  }
+
+  async function niRetry() {
+    const r = await fetch('/api/newitems/retry', {method: 'POST'});
     const d = await r.json().catch(() => ({message: 'Server error'}));
     if (d.status !== 'ok') alert(d.message);
     niRefresh();
