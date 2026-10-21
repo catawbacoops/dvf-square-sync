@@ -23,6 +23,7 @@ import pandas as pd
 from flask import Flask, request, jsonify, render_template_string, Response
 
 import newitems
+import catmatch
 
 # ---------------------------------------------------------------------------
 # Config from environment variables
@@ -453,6 +454,50 @@ def newitems_debug_search():
     try:
         return jsonify(newitems.debug_search(q))
     except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def _square_lister(types):
+    return newitems._square_list(SQUARE_BASE_URL, SQUARE_HEADERS, SQUARE_TIMEOUT, types)
+
+
+@app.route("/api/newitems/category_preview")
+def newitems_category_preview():
+    """
+    Preview only — changes nothing. ?sku=100120
+    Shows DVF's category path, the matching Square category, and where the
+    item sits in Square now (if it exists).
+    """
+    sku = re.sub(r"\s", "", request.args.get("sku", "")).upper()
+    if not sku:
+        return jsonify({"error": "add ?sku=XXXXXX"}), 400
+    try:
+        prod, err = newitems.gql_product(sku)
+        tree = catmatch.load_tree(_square_lister, force=bool(request.args.get("refresh")))
+        m = catmatch.match(prod, tree) if prod else None
+        out = {
+            "sku": sku,
+            "dvf_name": (prod or {}).get("name"),
+            "dvf_category_paths": catmatch.dvf_paths(prod) if prod else [],
+            "dvf_error": err,
+            "square_categories_loaded": len(tree["cats"]),
+            "items_store_categories_as": tree["pattern"],
+            "now_in_square": catmatch.item_category_path(sku, tree),
+            "proposed": None,
+        }
+        if m:
+            cats = tree["cats"]
+            node = cats[m["cat_id"]]
+            out["proposed"] = {
+                "square_path": " > ".join(m["square_path"]),
+                "fully_matched": not m["missing"],
+                "dvf_levels_missing_in_square": m["missing"],
+                "existing_subcategories_here": sorted(cats[k]["name"] for k in tree["children"].get(node["id"], [])),
+                "category_ids_to_assign": m["category_ids"],
+            }
+        return jsonify(out)
+    except Exception as e:
+        log.exception("category preview")
         return jsonify({"error": str(e)}), 500
 
 
