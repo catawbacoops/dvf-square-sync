@@ -190,6 +190,32 @@ def _best_description(soup, fallback):
     return best if len(best) >= len(fallback) else fallback
 
 
+TAB_LABELS = ("description", "ingredients", "nutrition", "nutrition facts",
+              "specifications", "reviews", "allergens", "details", "directions")
+
+
+def _clean_description(t):
+    """Strip tab labels the page puts around the text, e.g.
+    'Description Amish Origins... Ingredients' -> 'Amish Origins...'."""
+    t = (t or "").strip()
+    changed = True
+    while changed and t:
+        changed = False
+        low = t.lower()
+        for lab in TAB_LABELS:
+            if low.startswith(lab + " ") or low.startswith(lab + ":"):
+                t = t[len(lab) + 1:].lstrip(" :"); changed = True; break
+            if low.endswith(" " + lab) or low == lab:
+                t = t[:len(t) - len(lab)].rstrip(" :"); changed = True; break
+    return t.strip()
+
+
+def _clean_brand(b):
+    b = re.sub(r"^\s*view\s+all\s+", "", b or "", flags=re.I)
+    b = re.sub(r"\s+products\s*$", "", b, flags=re.I)
+    return b.strip()
+
+
 def _bigger_image(url):
     """BigCommerce URLs end in .<w>.<h>.jpg — ask for a large version."""
     return re.sub(r"\.\d+\.\d+\.(jpe?g|png|gif)", r".1280.1280.\1", url, flags=re.I)
@@ -229,15 +255,17 @@ def scrape_dvf(sku, session=None):
     brand = (_text(soup.select_one('[itemprop="brand"]'))
              or _text(soup.select_one(".productView-brand")))
     crumbs = [_text(li) for li in soup.select(".breadcrumbs li, nav.breadcrumb li, .breadcrumb li")]
-    crumbs = [c for c in crumbs if c and c.lower() != "home"]
+    crumbs = [c for c in crumbs if c and c.lower() not in ("home", "products")]
+    if crumbs and crumbs[-1].lower() == name.lower():
+        crumbs = crumbs[:-1]
 
     out.update({
         "found": True,
         "name": name,
-        "description": _best_description(soup, _meta(soup, "og:description")),
+        "description": _clean_description(_best_description(soup, _meta(soup, "og:description"))),
         "image": image,
         "image_large": _bigger_image(image) if image else "",
-        "brand": brand,
+        "brand": _clean_brand(brand),
         "breadcrumb": " > ".join(crumbs),
         "availability": _meta(soup, "og:availability"),
         "sku_verified": bool(sku_seen),
