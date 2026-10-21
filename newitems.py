@@ -714,17 +714,60 @@ def _item_payload(row, currency, category_ids, upc):
     }
 
 
+IMG_HEADERS = {"User-Agent": DVF_HEADERS["User-Agent"],
+               "Accept": "image/jpeg,image/png,image/gif;q=0.9,*/*;q=0.1"}
+
+
+def _sniff(data):
+    """Real image format from the file's first bytes (ignores the server's label)."""
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image/webp"
+    if data[4:12] in (b"ftypavif", b"ftypavis"):
+        return "image/avif"
+    return "unknown"
+
+
+def _to_square_image(data):
+    """Return (bytes, content_type) Square accepts, converting WebP/AVIF/etc. to JPEG."""
+    kind = _sniff(data)
+    if kind in ("image/jpeg", "image/png", "image/gif"):
+        return data, kind
+    from PIL import Image
+    im = Image.open(io.BytesIO(data))
+    im.load()
+    if im.mode in ("RGBA", "LA", "P"):
+        im = im.convert("RGBA")
+        bg = Image.new("RGB", im.size, (255, 255, 255))
+        bg.paste(im, mask=im.split()[-1])
+        im = bg
+    elif im.mode != "RGB":
+        im = im.convert("RGB")
+    out = io.BytesIO()
+    im.save(out, "JPEG", quality=90)
+    return out.getvalue(), "image/jpeg"
+
+
 def _upload_image(base, headers, item_id, row, session):
+    last_err = "no image"
     for url in [row.get("image_large"), row.get("image")]:
         if not url:
             continue
         try:
-            img = session.get(url, headers=DVF_HEADERS, timeout=DVF_TIMEOUT)
+            img = session.get(url, headers=IMG_HEADERS, timeout=DVF_TIMEOUT)
             if img.status_code != 200 or len(img.content) < 500:
+                last_err = f"image download HTTP {img.status_code}"
                 continue
-            ctype = img.headers.get("Content-Type", "image/jpeg").split(";")[0]
-            if ctype not in ("image/jpeg", "image/png", "image/gif", "image/pjpeg"):
-                ctype = "image/jpeg"
+            try:
+                data, ctype = _to_square_image(img.content)
+            except Exception as e:
+                last_err = f"could not read image ({_sniff(img.content)}): {e}"
+                continue
             req = {
                 "idempotency_key": str(uuid.uuid4()),
                 "object_id": item_id,
@@ -737,14 +780,90 @@ def _upload_image(base, headers, item_id, row, session):
             r = requests.post(
                 f"{base}/catalog/images", headers=h,
                 files={"request": (None, json.dumps(req), "application/json"),
-                       "file": (f"{row['sku']}.{ext}", img.content, ctype)},
+                       "file": (f"{row['sku']}.{ext}", data, ctype)},
                 timeout=(10, 60))
             if r.ok:
                 return True, ""
-            return False, f"image upload failed ({r.status_code}): {r.text[:150]}"
+            last_err = f"image upload failed ({r.status_code}): {r.text[:150]}"
         except requests.RequestException as e:
-            return False, f"image download/upload error: {e}"
-    return False, "no image"
+            last_err = f"image download/upload error: {e}"
+    return False, last_err
+
+
+def _fix_images_worker(rows, base, headers):
+    session = requests.Session()
+    total = len(rows)
+    _job(phase="create", done=0, total=total, message="Adding missing images…", log=[])
+    fixed = 0
+    for i, row in enumerate(rows, 1):
+        ok, err = _upload_image(base, headers, row["square_id"], row, session)
+        if ok:
+            fixed += 1
+            status = re.sub(r" \(no image:.*?\)(?= \(|$)", "", row.get("status", "created"))
+            _set_result(row["sku"], status=status)
+        else:
+            _set_result(row["sku"], status=f"created (no image: {err})")
+        _job(done=i)
+        time.sleep(0.2)
+    _job(phase="review", message=f"🖼 Added images to {fixed} of {total} item(s).")
+
+
+def _fix_skus_worker(skus, base, headers, timeout):
+    """Add DVF images to existing Square items (by SKU) that have no image."""
+    total = len(skus)
+    _job(phase="create", done=0, total=total, message="Adding images by SKU…", log=[])
+    session = requests.Session()
+    try:
+        items = _square_list(base, headers, timeout, "ITEM")
+    except Exception as e:
+        _job(phase="review", message=f"❌ Could not read Square catalog: {e}")
+        return
+    sku_to_item = {}
+    for it in items:
+        for v in it.get("item_data", {}).get("variations", []):
+            k = v.get("item_variation_data", {}).get("sku", "").strip().upper()
+            if k:
+                sku_to_item[k] = it
+    done_msgs = []
+    for i, sku in enumerate(skus, 1):
+        it = sku_to_item.get(sku)
+        if it is None:
+            done_msgs.append(f"{sku}: not in Square")
+        elif it.get("item_data", {}).get("image_ids"):
+            done_msgs.append(f"{sku}: already has an image")
+        else:
+            row = next((r for r in STATE["results"] if r["sku"] == sku and r.get("image")), None)
+            if row is None:
+                row = scrape_dvf(sku, session=session)
+            if not row.get("image"):
+                done_msgs.append(f"{sku}: no image on DVF")
+            else:
+                ok, err = _upload_image(base, headers, it["id"], dict(row, sku=sku), session)
+                done_msgs.append(f"{sku}: {'image added' if ok else err}")
+                if ok:
+                    _set_result(sku, status="created")
+        _job(done=i)
+        time.sleep(0.2)
+    _job(phase="review", message="🖼 " + " · ".join(done_msgs))
+
+
+def start_fix_images(base, headers, timeout=(10, 25), skus=None):
+    if job_busy():
+        return False, "A job is already running."
+    if skus:
+        clean = []
+        for x in skus:
+            x = re.sub(r"\s", "", str(x)).upper()
+            if x and x not in clean:
+                clean.append(x)
+        threading.Thread(target=_fix_skus_worker, args=(clean, base, headers, timeout),
+                         daemon=True).start()
+        return True, f"Adding images for {len(clean)} SKU(s)…"
+    rows = [r for r in STATE["results"] if r.get("square_id") and "no image" in (r.get("status") or "")]
+    if not rows:
+        return False, "No created items are missing images."
+    threading.Thread(target=_fix_images_worker, args=(rows, base, headers), daemon=True).start()
+    return True, f"Adding images to {len(rows)} item(s)…"
 
 
 def _create_worker(rows, base, headers, timeout, currency):

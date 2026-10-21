@@ -469,6 +469,19 @@ def newitems_retry():
     return jsonify({"status": "ok" if ok else "error", "message": msg}), (200 if ok else 409)
 
 
+@app.route("/api/newitems/fix_images", methods=["POST"])
+def newitems_fix_images():
+    if not SQUARE_ACCESS_TOKEN:
+        return jsonify({"status": "error", "message": "SQUARE_ACCESS_TOKEN not configured."}), 500
+    body = request.get_json(silent=True) or {}
+    skus = body.get("skus") or []
+    if isinstance(skus, str):
+        skus = re.split(r"[,\s]+", skus)
+    skus = [x for x in skus if x]
+    ok, msg = newitems.start_fix_images(SQUARE_BASE_URL, SQUARE_HEADERS, SQUARE_TIMEOUT, skus)
+    return jsonify({"status": "ok" if ok else "error", "message": msg}), (200 if ok else 409)
+
+
 @app.route("/api/newitems/create", methods=["POST"])
 def newitems_create():
     if not SQUARE_ACCESS_TOKEN:
@@ -802,6 +815,12 @@ HTML = '''<!DOCTYPE html>
     </div>
     <div class="btn-row">
       <button class="btn amber" id="ni-retry" onclick="niRetry()" style="display:none">↻ Retry Not Found</button>
+      <button class="btn amber" id="ni-fiximg" onclick="niFixImages()" style="display:none">🖼 Add Missing Images</button>
+    </div>
+    <div class="btn-row" style="align-items:stretch">
+      <input id="ni-fixskus" placeholder="SKUs missing images, e.g. 633006, 144026"
+             style="flex:2;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-family:var(--mono);font-size:12px">
+      <button class="btn" onclick="niFixSkus()" style="flex:1">🖼 Add Images</button>
     </div>
     <div class="ni-tools" id="ni-tools">
       <label><input type="checkbox" id="ni-all" onchange="niToggleAll(this.checked)"> Select all</label>
@@ -992,6 +1011,10 @@ HTML = '''<!DOCTYPE html>
     const rb = document.getElementById('ni-retry');
     rb.style.display = nf && !busy ? 'flex' : 'none';
     rb.textContent = `↻ Retry ${nf} Not Found`;
+    const ni = (s.results || []).filter(r => r.square_id && (r.status || '').includes('no image')).length;
+    const fb = document.getElementById('ni-fiximg');
+    fb.style.display = ni && !busy ? 'flex' : 'none';
+    fb.textContent = `🖼 Add ${ni} Missing Image${ni === 1 ? '' : 's'}`;
 
     const rows = s.results || [];
     const show = rows.length > 0;
@@ -1047,6 +1070,22 @@ HTML = '''<!DOCTYPE html>
 
   async function niRetry() {
     const r = await fetch('/api/newitems/retry', {method: 'POST'});
+    const d = await r.json().catch(() => ({message: 'Server error'}));
+    if (d.status !== 'ok') alert(d.message);
+    niRefresh();
+  }
+
+  async function niFixSkus() {
+    const v = document.getElementById('ni-fixskus').value.trim();
+    if (!v) return;
+    const r = await fetch('/api/newitems/fix_images', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({skus: v})});
+    const d = await r.json().catch(() => ({message: 'Server error'}));
+    if (d.status !== 'ok') alert(d.message);
+    niRefresh();
+  }
+
+  async function niFixImages() {
+    const r = await fetch('/api/newitems/fix_images', {method: 'POST'});
     const d = await r.json().catch(() => ({message: 'Server error'}));
     if (d.status !== 'ok') alert(d.message);
     niRefresh();
