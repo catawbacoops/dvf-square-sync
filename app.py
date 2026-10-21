@@ -126,7 +126,7 @@ def archive_items(item_ids):
 def update_prices(df, sku_map):
     """
     Update Square item variation prices from the wholesale price list.
-    Retail price = unit_price / (1 - gp_pct)
+    Retail price = case_price / (1 - gp_pct)  (sold by the case only)
     """
     import copy
     messages = []
@@ -222,13 +222,13 @@ def read_price_list(file_storage):
             data["gp_pct"].str.replace("%", "").str.strip(), errors="coerce"
         ) / 100
 
-        # Unit price as float (column 4 = per-each price; column 2 is the CASE price)
-        data["unit_price_num"] = pd.to_numeric(data["unit_price"], errors="coerce")
+        # Case price as float (column 2). Items are sold BY THE CASE only.
+        data["case_price_num"] = pd.to_numeric(data["case_price"], errors="coerce")
 
-        # Calculate retail = unit_price / (1 - gp%)
+        # Calculate retail = case_price / (1 - gp%)
         # Guard against GP% >= 100% (would divide by zero or go negative)
         data.loc[data["gp_clean"] >= 1, "gp_clean"] = float("nan")
-        data["retail_calc"] = (data["unit_price_num"] / (1 - data["gp_clean"])).round(2)
+        data["retail_calc"] = (data["case_price_num"] / (1 - data["gp_clean"])).round(2)
 
         # Drop rows where calculation failed
         data = data.dropna(subset=["retail_calc"])
@@ -664,11 +664,11 @@ HTML = '''<!DOCTYPE html>
     <div class="card-title">💰 Price Update</div>
     <div class="card-desc">
       Upload your DVF wholesale price list. Retail prices are calculated as
-      <strong style="color:var(--blue)">Unit Price ÷ (1 - GP%)</strong>
+      <strong style="color:var(--blue)">Case Price ÷ (1 - GP%)</strong>
       and uploaded to Square for every matching SKU.
     </div>
     <div class="tags">
-      <span class="tag blue" style="border-color:#3b82f655;color:var(--blue);background:var(--blue-dim)">Retail = Unit ÷ (1 - GP%)</span>
+      <span class="tag blue" style="border-color:#3b82f655;color:var(--blue);background:var(--blue-dim)">Retail = Case ÷ (1 - GP%)</span>
       <span class="tag green">Updates prices</span>
     </div>
     <div class="dropzone" id="dz-price">
