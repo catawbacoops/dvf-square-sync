@@ -320,6 +320,35 @@ query ($sku: String!) {
 }"""
 
 
+_WEIGHT_RE = re.compile(r"weight\s*:?\s*([\d.,]+)\s*(lbs?|pounds?|oz|ounces?|kg|g)\b", re.I)
+
+
+def page_weight(html_or_soup):
+    """Find 'Weight 50.50 LBS' on a DVF product page -> (50.5, 'lb') or (None, '')."""
+    soup = html_or_soup if hasattr(html_or_soup, "select") else BeautifulSoup(html_or_soup or "", "html.parser")
+    el = soup.select_one("[data-product-weight]")
+    texts = [_text(el)] if el else []
+    for dt in soup.find_all(["dt", "th", "strong", "span", "div", "label"]):
+        if _text(dt).strip(" :").lower() == "weight":
+            sib = dt.find_next_sibling() or dt.find_next()
+            texts.append("Weight " + _text(sib))
+    texts.append(_text(soup))
+    for t in texts:
+        if not t:
+            continue
+        # A bare value from [data-product-weight] ("50.50 LBS") needs the label added
+        m = _WEIGHT_RE.search(t) or (el is not None and t == texts[0] and _WEIGHT_RE.search("weight " + t))
+        if m:
+            try:
+                val = float(m.group(1).replace(",", ""))
+            except ValueError:
+                continue
+            u = m.group(2).lower()
+            unit = "lb" if u.startswith(("lb", "pound")) else ("oz" if u.startswith(("oz", "ounce")) else u)
+            return val, unit
+    return None, ""
+
+
 def _dvf_paths(prod):
     import catmatch
     try:
@@ -443,6 +472,17 @@ def scrape_dvf(sku, session=None, name_hint=""):
             "weight_unit": (prod.get("weight") or {}).get("unit", ""),
         })
         if out["name"]:
+            if not out.get("weight") and prod.get("path"):
+                try:
+                    presp = _fetch(s, DVF_BASE + prod["path"])
+                    if presp.status_code == 200:
+                        w, u = page_weight(presp.text)
+                        if w:
+                            out["weight"], out["weight_unit"], out["weight_from"] = w, u, "product page"
+                except requests.RequestException:
+                    pass
+            elif out.get("weight"):
+                out["weight_from"] = "storefront API"
             return out
 
     try:
@@ -549,6 +589,10 @@ def scrape_dvf(sku, session=None, name_hint=""):
         "availability": _meta(soup, "og:availability"),
         "sku_verified": bool(sku_seen),
     })
+    if not out.get("weight"):
+        w, u = page_weight(soup)
+        if w:
+            out["weight"], out["weight_unit"], out["weight_from"] = w, u, "product page"
     return out
 
 
