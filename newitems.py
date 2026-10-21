@@ -319,6 +319,14 @@ query ($sku: String!) {
 }"""
 
 
+def _dvf_paths(prod):
+    import catmatch
+    try:
+        return catmatch.dvf_paths(prod)
+    except Exception:
+        return []
+
+
 def gql_product(sku, session=None):
     """Exact-SKU lookup through the BigCommerce storefront GraphQL API."""
     tok = storefront_token(session)
@@ -429,6 +437,7 @@ def scrape_dvf(sku, session=None, name_hint=""):
             "brand": (prod.get("brand") or {}).get("name", ""),
             "breadcrumb": " / ".join(cats), "availability": "",
             "sku_verified": True,
+            "dvf_paths": _dvf_paths(prod),
         })
         if out["name"]:
             return out
@@ -599,8 +608,20 @@ def start_retry_not_found():
     rows = [r for r in STATE["results"] if not r.get("found") and not r.get("square_id")]
     if not rows:
         return False, "Nothing to retry."
-    threading.Thread(target=_retry_worker, args=(rows,), daemon=True).start()
+    threading.Thread(target=_guarded(_retry_worker), args=(rows,), daemon=True).start()
     return True, f"Retrying {len(rows)} SKU(s)."
+
+
+def _guarded(fn):
+    """Run a background worker; if it crashes, record the error and free the app."""
+    def run(*args):
+        try:
+            fn(*args)
+        except Exception as e:
+            log.exception("Background job failed")
+            _job(phase="review" if STATE["results"] else "idle",
+                 message=f"❌ Job stopped with an error: {e}")
+    return run
 
 
 def start_lookup(skus=None):
@@ -612,7 +633,7 @@ def start_lookup(skus=None):
         rows = [r for r in rows if r["sku"] in wanted]
     if not rows:
         return False, "No missing SKUs. Run a Price Update first."
-    threading.Thread(target=_lookup_worker, args=(rows,), daemon=True).start()
+    threading.Thread(target=_guarded(_lookup_worker), args=(rows,), daemon=True).start()
     return True, f"Started lookup of {len(rows)} SKU(s)."
 
 
@@ -856,25 +877,137 @@ def start_fix_images(base, headers, timeout=(10, 25), skus=None):
             x = re.sub(r"\s", "", str(x)).upper()
             if x and x not in clean:
                 clean.append(x)
-        threading.Thread(target=_fix_skus_worker, args=(clean, base, headers, timeout),
+        threading.Thread(target=_guarded(_fix_skus_worker), args=(clean, base, headers, timeout),
                          daemon=True).start()
         return True, f"Adding images for {len(clean)} SKU(s)…"
     rows = [r for r in STATE["results"] if r.get("square_id") and "no image" in (r.get("status") or "")]
     if not rows:
         return False, "No created items are missing images."
-    threading.Thread(target=_fix_images_worker, args=(rows, base, headers), daemon=True).start()
+    threading.Thread(target=_guarded(_fix_images_worker), args=(rows, base, headers), daemon=True).start()
     return True, f"Adding images to {len(rows)} item(s)…"
+
+
+def _create_category(base, headers, timeout, name, parent_id):
+    payload = {
+        "idempotency_key": str(uuid.uuid4()),
+        "object": {
+            "type": "CATEGORY", "id": "#cat", "present_at_all_locations": True,
+            "category_data": {"name": name[:255], "parent_category": {"id": parent_id},
+                              "category_type": "REGULAR_CATEGORY", "online_visibility": True},
+        },
+    }
+    r = requests.post(f"{base}/catalog/object", headers=headers, json=payload, timeout=timeout)
+    if not r.ok:
+        # Retry with only the essentials in case an optional field is rejected
+        payload["object"]["category_data"] = {"name": name[:255], "parent_category": {"id": parent_id}}
+        payload["idempotency_key"] = str(uuid.uuid4())
+        r = requests.post(f"{base}/catalog/object", headers=headers, json=payload, timeout=timeout)
+    r.raise_for_status()
+    new_id = r.json()["catalog_object"]["id"]
+    _job_log(f"📁 Created category {name}")
+    return new_id
+
+
+def _resolve_categories(row, tree, create_cat, section_cats):
+    """DVF category path first; fall back to the price-list section vote."""
+    import catmatch
+    paths = row.get("dvf_paths") or []
+    if paths:
+        try:
+            ids, path, made = catmatch.resolve(paths, tree, create_cat)
+            if ids:
+                return tuple(ids), path, made
+        except Exception as e:
+            _job_log(f"⚠️ {row['sku']}: category match failed ({e}); using section")
+    ids = section_cats.get(row.get("section", ""), ())
+    path = " > ".join(tree["cats"][ids[-1]]["chain"]) if ids and ids[-1] in tree["cats"] else ""
+    return tuple(ids), path, []
+
+
+def _fix_cats_worker(skus, base, headers, timeout):
+    """Move existing Square items to the category matching DVF's path."""
+    import catmatch
+    total = len(skus)
+    _job(phase="create", done=0, total=total, message="Fixing categories…", log=[])
+    try:
+        tree = catmatch.load_tree(lambda t: _square_list(base, headers, timeout, t), force=True)
+    except Exception as e:
+        _job(phase="review", message=f"❌ Could not read Square catalog: {e}")
+        return
+    sku_to_item = {}
+    for it in tree["items"]:
+        for v in it.get("item_data", {}).get("variations", []):
+            k = v.get("item_variation_data", {}).get("sku", "").strip().upper()
+            if k:
+                sku_to_item[k] = it
+    session = requests.Session()
+    msgs, new_cats = [], []
+    create_cat = lambda name, pid: _create_category(base, headers, timeout, name, pid)
+    for i, sku in enumerate(skus, 1):
+        it = sku_to_item.get(sku)
+        if it is None:
+            msgs.append(f"{sku}: not in Square")
+        else:
+            prod, err = gql_product(sku, session=session)
+            paths = _dvf_paths(prod) if prod else []
+            if not paths:
+                msgs.append(f"{sku}: no DVF category ({err or 'none listed'})")
+            else:
+                ids, path, made = catmatch.resolve(paths, tree, create_cat)
+                new_cats += made
+                if not ids:
+                    msgs.append(f"{sku}: DVF path {' > '.join(paths[0])} has no match in Square")
+                else:
+                    obj = copy.deepcopy(it)
+                    for f in ("updated_at", "created_at", "is_deleted", "catalog_v1_ids"):
+                        obj.pop(f, None)
+                    obj["item_data"]["categories"] = [{"id": c} for c in ids]
+                    obj["item_data"]["reporting_category"] = {"id": ids[-1]}
+                    obj["item_data"].pop("category_id", None)
+                    r = requests.post(f"{base}/catalog/object", headers=headers, timeout=timeout,
+                                      json={"idempotency_key": str(uuid.uuid4()), "object": obj})
+                    if r.ok:
+                        msgs.append(f"{sku} → {path}")
+                        _set_result(sku, square_category=path)
+                    else:
+                        msgs.append(f"{sku}: update failed ({r.status_code}) {r.text[:120]}")
+        _job(done=i)
+        time.sleep(0.2)
+    msg = "📁 " + " · ".join(msgs)
+    if new_cats:
+        msg += f" | New categories: {'; '.join(new_cats)}"
+    _job(phase="review", message=msg)
+
+
+def start_fix_categories(base, headers, timeout, skus):
+    if job_busy():
+        return False, "A job is already running."
+    clean = []
+    for x in skus or []:
+        x = re.sub(r"\s", "", str(x)).upper()
+        if x and x not in clean:
+            clean.append(x)
+    if not clean:
+        return False, "Enter one or more SKUs."
+    threading.Thread(target=_guarded(_fix_cats_worker), args=(clean, base, headers, timeout), daemon=True).start()
+    return True, f"Fixing categories for {len(clean)} SKU(s)…"
 
 
 def _create_worker(rows, base, headers, timeout, currency):
     total = len(rows)
     _job(phase="create", done=0, total=total, message="Preparing…", log=[])
+    import catmatch
     try:
-        items = _square_list(base, headers, timeout, "ITEM")
+        tree = catmatch.load_tree(lambda t: _square_list(base, headers, timeout, t), force=True)
+        items = tree["items"]
         section_cats, sku_to_item = build_section_categories(STATE.get("sections", {}), items)
     except Exception as e:
         _job(phase="review", message=f"❌ Could not read Square catalog: {e}")
         return
+    new_cats = []
+
+    def create_cat(name, parent_id):
+        return _create_category(base, headers, timeout, name, parent_id)
 
     session = requests.Session()
     created = skipped = failed = no_img = 0
@@ -892,7 +1025,8 @@ def _create_worker(rows, base, headers, timeout, currency):
             _job(done=i)
             continue
 
-        cats = section_cats.get(row.get("section", ""), ())
+        cats, cat_path, made = _resolve_categories(row, tree, create_cat, section_cats)
+        new_cats += made
         upc = next((u for u in (row.get("case_upc"), row.get("retail_upc")) if _valid_gtin(u)), "")
         payload = _item_payload(row, currency, cats, upc)
         r = requests.post(f"{base}/catalog/object", headers=headers, json=payload, timeout=timeout)
@@ -916,7 +1050,7 @@ def _create_worker(rows, base, headers, timeout, currency):
         status = "created" + ("" if ok else f" (no image: {img_err})")
         if not cats:
             status += " (no category)"
-        _set_result(sku, status=status, square_id=item_id, selected=False)
+        _set_result(sku, status=status, square_id=item_id, selected=False, square_category=cat_path)
         _job(done=i)
         time.sleep(0.2)
 
@@ -927,6 +1061,8 @@ def _create_worker(rows, base, headers, timeout, currency):
         msg += f" ❌ {failed} failed."
     if no_img:
         msg += f" ⚠️ {no_img} created without an image."
+    if new_cats:
+        msg += f" 📁 New categories: {'; '.join(new_cats[:10])}{'…' if len(new_cats) > 10 else ''}"
     _job(phase="review", message=msg)
 
 
@@ -945,7 +1081,7 @@ def start_create(skus, base, headers, timeout, currency):
     rows = [r for r in STATE["results"] if r["sku"] in wanted]
     if not rows:
         return False, "No items selected."
-    threading.Thread(target=_create_worker,
+    threading.Thread(target=_guarded(_create_worker),
                      args=(rows, base, headers, timeout, currency),
                      daemon=True).start()
     return True, f"Creating {len(rows)} item(s)…"

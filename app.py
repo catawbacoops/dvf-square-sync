@@ -527,6 +527,19 @@ def newitems_fix_images():
     return jsonify({"status": "ok" if ok else "error", "message": msg}), (200 if ok else 409)
 
 
+@app.route("/api/newitems/fix_categories", methods=["POST"])
+def newitems_fix_categories():
+    if not SQUARE_ACCESS_TOKEN:
+        return jsonify({"status": "error", "message": "SQUARE_ACCESS_TOKEN not configured."}), 500
+    body = request.get_json(silent=True) or {}
+    skus = body.get("skus") or []
+    if isinstance(skus, str):
+        skus = re.split(r"[,\s]+", skus)
+    ok, msg = newitems.start_fix_categories(SQUARE_BASE_URL, SQUARE_HEADERS, SQUARE_TIMEOUT,
+                                            [x for x in skus if x])
+    return jsonify({"status": "ok" if ok else "error", "message": msg}), (200 if ok else 409)
+
+
 @app.route("/api/newitems/create", methods=["POST"])
 def newitems_create():
     if not SQUARE_ACCESS_TOKEN:
@@ -863,9 +876,12 @@ HTML = '''<!DOCTYPE html>
       <button class="btn amber" id="ni-fiximg" onclick="niFixImages()" style="display:none">🖼 Add Missing Images</button>
     </div>
     <div class="btn-row" style="align-items:stretch">
-      <input id="ni-fixskus" placeholder="SKUs missing images, e.g. 633006, 144026"
+      <input id="ni-fixskus" placeholder="Existing SKUs to fix, e.g. 100120, 633006"
              style="flex:2;padding:10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-family:var(--mono);font-size:12px">
-      <button class="btn" onclick="niFixSkus()" style="flex:1">🖼 Add Images</button>
+    </div>
+    <div class="btn-row">
+      <button class="btn" onclick="niFixSkus()">🖼 Add Images</button>
+      <button class="btn" onclick="niFixCats()">📁 Fix Categories</button>
     </div>
     <div class="ni-tools" id="ni-tools">
       <label><input type="checkbox" id="ni-all" onchange="niToggleAll(this.checked)"> Select all</label>
@@ -1077,7 +1093,9 @@ HTML = '''<!DOCTYPE html>
       const created = r.square_id;
       const on = niSel.has(r.sku) && !created;
       let sub = `SKU ${esc(r.sku)}`;
-      if (r.section) sub += ` · ${esc(r.section)}`;
+      if (r.square_category) sub += ` · 📁 ${esc(r.square_category)}`;
+      else if (r.breadcrumb) sub += ` · DVF: ${esc(r.breadcrumb)}`;
+      else if (r.section) sub += ` · ${esc(r.section)}`;
       let flag = '';
       if (r.status) flag = `<div class="ni-sub ${created ? 'ni-ok' : 'ni-bad'}">${esc(r.status)}</div>`;
       else if (!r.found) flag = `<div class="ni-sub ni-bad">Not found on DVF — ${esc(r.error || '')}. Name is from the price list.</div>`;
@@ -1124,6 +1142,16 @@ HTML = '''<!DOCTYPE html>
     const v = document.getElementById('ni-fixskus').value.trim();
     if (!v) return;
     const r = await fetch('/api/newitems/fix_images', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({skus: v})});
+    const d = await r.json().catch(() => ({message: 'Server error'}));
+    if (d.status !== 'ok') alert(d.message);
+    niRefresh();
+  }
+
+  async function niFixCats() {
+    const v = document.getElementById('ni-fixskus').value.trim();
+    if (!v) return;
+    if (!confirm('Move these items to the category matching DVF (creating subcategories if needed)?')) return;
+    const r = await fetch('/api/newitems/fix_categories', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({skus: v})});
     const d = await r.json().catch(() => ({message: 'Server error'}));
     if (d.status !== 'ok') alert(d.message);
     niRefresh();

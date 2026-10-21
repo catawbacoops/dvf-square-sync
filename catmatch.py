@@ -190,3 +190,51 @@ def item_category_path(sku, tree):
                         "category_ids": ids,
                         "paths": [" > ".join(tree["cats"][i]["chain"]) for i in ids if i in tree["cats"]]}
     return None
+
+
+# ---------------------------------------------------------------------------
+# Resolve (and create if needed) the category for a product
+# ---------------------------------------------------------------------------
+
+def nice_name(level):
+    """'misc covered' -> 'Misc Covered'; keeps names that already have capitals."""
+    return level if any(ch.isupper() for ch in level) else " ".join(w.capitalize() for w in level.split())
+
+
+def resolve(paths, tree, create_fn):
+    """
+    paths: DVF category paths (lists of level names, from dvf_paths()).
+    create_fn(name, parent_id) -> new category id.
+    Returns (category_ids, square_path_str, created_names) or (None, "", []) if no match.
+    """
+    prod = {"categories": {"edges": [{"node": {"path": "/" + "/".join(p) + "/", "name": p[-1]}} for p in paths]}}
+    # dvf_paths() lowercases slugs; keep the original names we were given
+    best = None
+    for levels in paths:
+        m = _match_one(levels, tree)
+        if m and (best is None or (not m["missing"], m["depth"], -m["extra_roots"]) >
+                  (not best["missing"], best["depth"], -best["extra_roots"])):
+            best = m
+    if not best:
+        return None, "", []
+    cats, children = tree["cats"], tree["children"]
+    node_id = best["cat_id"]
+    created = []
+    for level in best["missing"]:
+        # Another item in this run may have created it already
+        existing = next((k for k in children.get(node_id, []) if same(cats[k]["name"], level)), None)
+        if existing:
+            node_id = existing
+            continue
+        name = nice_name(level)
+        new_id = create_fn(name, node_id)
+        parent = cats[node_id]
+        cats[new_id] = {"id": new_id, "name": name, "parent": node_id,
+                        "chain_ids": parent["chain_ids"] + [new_id],
+                        "chain": parent["chain"] + [name]}
+        children.setdefault(node_id, []).append(new_id)
+        created.append(" > ".join(cats[new_id]["chain"]))
+        node_id = new_id
+    c = cats[node_id]
+    ids = c["chain_ids"] if tree["pattern"] == "chain" else [c["id"]]
+    return ids, " > ".join(c["chain"]), created
